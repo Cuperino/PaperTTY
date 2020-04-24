@@ -16,6 +16,8 @@ import drivers.drivers_partial as drivers_partial
 import drivers.drivers_full as drivers_full
 import drivers.drivers_color as drivers_color
 import drivers.drivers_colordraw as drivers_colordraw
+import drivers.driver_it8951 as driver_it8951
+import drivers.drivers_4in2 as driver_4in2
 
 # for ioctl
 import fcntl
@@ -27,6 +29,7 @@ import signal
 import struct
 # for stdin and exit
 import sys
+import select
 # for setting TTY size
 import termios
 # for sleeping
@@ -50,19 +53,29 @@ class PaperTTY:
     initialized = None
     font = None
     fontsize = None
+    font_height = None
+    font_width = None
     white = None
     black = None
     encoding = None
+    spacing = 0
+    cursor = None
+    rows = None
+    cols = None
+    is_truetype = None
+    fontfile = None
 
-    def __init__(self, driver, font=defaultfont, fontsize=defaultsize, partial=None, encoding='utf-8'):
+    def __init__(self, driver, font=defaultfont, fontsize=defaultsize, partial=None, encoding='utf-8', spacing=0, cursor=None):
         """Create a PaperTTY with the chosen driver and settings"""
         self.driver = get_drivers()[driver]['class']()
-        self.font = self.load_font(font, fontsize) if font else None
+        self.spacing = spacing
         self.fontsize = fontsize
+        self.font = self.load_font(font) if font else None
         self.partial = partial
         self.white = self.driver.white
         self.black = self.driver.black
         self.encoding = encoding
+        self.cursor = cursor
 
     def ready(self):
         """Check that the driver is loaded and initialized"""
@@ -74,9 +87,10 @@ class PaperTTY:
         print(msg)
         sys.exit(code)
 
-    @staticmethod
-    def set_tty_size(tty, rows, cols):
+    def set_tty_size(self, tty, rows, cols):
         """Set a TTY (/dev/tty*) to a certain size. Must be a real TTY that support ioctls."""
+        self.rows = rows
+        self.cols = cols
         with open(tty, 'w') as tty:
             size = struct.pack("HHHH", int(rows), int(cols), 0, 0)
             try:
@@ -86,25 +100,10 @@ class PaperTTY:
                 print("Try setting a sane size manually.")
 
     @staticmethod
-    def font_height(font, spacing=0):
-        """Calculate 'actual' height of a font"""
-        # check if font is a TrueType font
-        truetype = isinstance(font, ImageFont.FreeTypeFont)
-        # dirty trick to get "maximum height"
-        fh = font.getsize('hg')[1]
-        # get descent value
-        descent = font.getmetrics()[1] if truetype else 0
-        # the reported font size
-        size = font.size if truetype else fh
-        # Why descent/2? No idea, but it works "well enough" with
-        # big and small sizes
-        return size - (descent / 2) + spacing
-
-    @staticmethod
     def band(bb):
         """Stretch a bounding box's X coordinates to be divisible by 8,
            otherwise weird artifacts occur as some bits are skipped."""
-        return (bb[0] & 0xF8, bb[1], (bb[2] + 8) & 0xF8, bb[3]) if bb else None
+        return (int(bb[0] / 8) * 8, bb[1], int((bb[2] + 7) / 8) * 8, bb[3]) if bb else None
 
     @staticmethod
     def split(s, n):
@@ -130,6 +129,21 @@ class PaperTTY:
     def ttydev(vcsa):
         """Return associated tty for vcsa device, ie. /dev/vcsa1 -> /dev/tty1"""
         return vcsa.replace("vcsa", "tty")
+    
+    def vcsudev(self, vcsa):
+        """Return character width and associated vcs(u) for vcsa device,
+           ie. for /dev/vcsa1, retunr (4, "/dev/vcsu1") if vcsu is available, or
+           (1, "/dev/vcs1") if not"""
+        dev = vcsa.replace("vcsa", "vcsu")
+        if os.path.exists(dev):
+            if isinstance(self.font, ImageFont.FreeTypeFont):
+                return 4, dev
+            else:
+                print("Font {} doesn't support Unicode. Falling back to 8-bit encoding.".format(self.font.file))
+                return 1, vcsa.replace("vcsa", "vcs")
+        else:
+            print("System does not have /dev/vcsu. Falling back to 8-bit encoding.")
+            return 1, vcsa.replace("vcsa", "vcs")
 
     @staticmethod
     def valid_vcsa(vcsa):
@@ -159,47 +173,124 @@ class PaperTTY:
             print("No write access to {} so cannot set terminal size, maybe run with sudo?".format(tty))
         return True
 
-    def load_font(self, path, size):
+    def load_font(self, path, keep_if_not_found=False):
         """Load the PIL or TrueType font"""
         font = None
+        # If no path is given, reuse existing font path. Good for resizing.
+        path = path or self.fontfile
         if os.path.isfile(path):
             try:
                 # first check if the font looks like a PILfont
                 with open(path, 'rb') as f:
                     if f.readline() == b"PILfont\n":
+                        self.is_truetype = False
+                        print('Loading PIL font {}. Font size is ignored.'.format(path))
                         font = ImageFont.load(path)
                         # otherwise assume it's a TrueType font
                     else:
-                        font = ImageFont.truetype(path, size)
+                        self.is_truetype = True
+                        font = ImageFont.truetype(path, self.fontsize)
+                    self.fontfile = path
             except IOError:
                 self.error("Invalid font: '{}'".format(path))
+        elif keep_if_not_found:
+            print("The font '{}' could not be found, keep using old font.".format(path))
+            font = self.font
         else:
             print("The font '{}' could not be found, using fallback font instead.".format(path))
             font = ImageFont.load_default()
 
+        if font:
+            # get physical dimensions of font. Take the average width of
+            # 1000 M's because oblique fonts are complicated.
+            self.font_width = font.getsize('M' * 1000)[0] // 1000
+            if 'getmetrics' in dir(font):
+                metrics_ascent, metrics_descent = font.getmetrics()
+                self.spacing = int(self.spacing) if self.spacing != 'auto' else (metrics_descent - 2)
+                print('Setting spacing to {}.'.format(self.spacing))
+                # despite what the PIL docs say, ascent appears to be the
+                # height of the font, while descent is not, in fact, negative.
+                # Couuld use testing with more fonts.
+                self.font_height = metrics_ascent + self.spacing
+            else:
+                # No autospacing for pil fonts, but they usually don't need it.
+                self.spacing = int(self.spacing) if self.spacing != 'auto' else 0
+                # pil fonts don't seem to have metrics, but all
+                # characters seem to have the same height
+                self.font_height = font.getsize('a')[1] + self.spacing
+
         return font
+
+    def recalculate_font(self):
+        """Load the PIL or TrueType font"""
+        # get physical dimensions of font. Take the average width of
+        # 1000 M's because oblique fonts a complicated.
+        self.font_width = self.font.getsize('M' * 1000)[0] // 1000
+        if 'getmetrics' in dir(self.font):
+            metrics_ascent, metrics_descent = self.font.getmetrics()
+            self.spacing = int(self.spacing) if self.spacing != 'auto' else (metrics_descent - 2)
+            print('Setting spacing to {}.'.format(self.spacing))
+            # despite what the PIL docs say, ascent appears to be the
+            # height of the font, while descent is not, in fact, negative.
+            # Couuld use testing with more fonts.
+            self.font_height = metrics_ascent + self.spacing
+        else:
+            # No autospacing for pil fonts, but they usually don't need it.
+            self.spacing = int(self.spacing) if self.spacing != 'auto' else 0
+            # pil fonts don't seem to have metrics, but all
+            # characters seem to have the same height
+            self.font_height = self.font.getsize('a')[1] + self.spacing
 
     def init_display(self):
         """Initialize the display - call the driver's init method"""
         self.driver.init(partial=self.partial)
         self.initialized = True
 
-    def fit(self, portrait=False, spacing=0):
+    def fit(self, portrait=False):
         """Return the maximum columns and rows we can display with this font"""
         width = self.font.getsize('M')[0]
-        height = self.font_height(self.font, spacing)
+        height = self.font_height
         # hacky, subtract just a bit to avoid going over the border with small fonts
         pw = self.driver.width - 3
         ph = self.driver.height
         return int((pw if portrait else ph) / width), int((ph if portrait else pw) / height)
 
+    def draw_line_cursor(self, cursor, draw):
+        cur_x, cur_y = cursor[0], cursor[1]
+        width = self.font_width
+        # desired cursor width
+        cur_width = width - 1
+        # get font height
+        height = self.font_height
+        # starting X is the font width times current column
+        start_x = cur_x * width
+        offset = 0
+        if self.cursor != 'default': # only default and a number are valid in this context
+            offset = int(self.cursor)
+        # add 1 because rows start at 0 and we want the cursor at the bottom
+        start_y = (cur_y + 1) * height - 1 - offset
+        # draw the cursor line
+        draw.line((start_x, start_y, start_x + cur_width, start_y), fill=self.black)
+
+    def draw_block_cursor(self, cursor, image):
+        cur_x, cur_y = cursor[0], cursor[1]
+        width = self.font_width
+        # get font height
+        height = self.font_height
+        upper_left = (cur_x * width, cur_y * height)
+        lower_right = ((cur_x + 1) * width, (cur_y + 1) * height)
+        mask = Image.new('1', (image.width, image.height), self.black)
+        draw = ImageDraw.Draw(mask)
+        draw.rectangle([upper_left, lower_right], fill=self.white)
+        return ImageChops.logical_xor(image, mask)
+    
     def showvnc(self, host, display, password=None, rotate=None, invert=False, sleep=1, full_interval=100):
         with api.connect(':'.join([host, display]), password=password) as client:
             previous_vnc_image = None
             diff_bbox = None
             # number of updates; when it's 0, do a full refresh
             updates = 0
-            client.timeout = 10
+            client.timeout = 30
             while True:
                 try:
                     client.refreshScreen()
@@ -242,7 +333,7 @@ class PaperTTY:
                 previous_vnc_image = new_vnc_image.copy()
                 time.sleep(float(sleep))
 
-    def showtext(self, text, fill, cursor=None, portrait=False, flipx=False, flipy=False, oldimage=None, spacing=0):
+    def showtext(self, text, fill, cursor=None, portrait=False, flipx=False, flipy=False, oldimage=None):
         """Draw a string on the screen"""
         if self.ready():
             # set order of h, w according to orientation
@@ -251,24 +342,14 @@ class PaperTTY:
                               self.white)
             # create the Draw object and draw the text
             draw = ImageDraw.Draw(image)
-            draw.text((0, 0), text, font=self.font, fill=fill, spacing=spacing)
+            draw.text((0, 0), text, font=self.font, fill=fill, spacing=self.spacing)
 
             # if we want a cursor, draw it - the most convoluted part
-            if cursor:
-                cur_x, cur_y = cursor[0], cursor[1]
-                # get the width of the character under cursor
-                # (in case we didn't use a fixed width font...)
-                fw = self.font.getsize(chr(cursor[2]))[0]
-                # desired cursor width
-                cur_width = fw - 1
-                # get font height
-                height = self.font_height(self.font, spacing)
-                # starting X is the font width times current column
-                start_x = cur_x * fw
-                # add 1 because rows start at 0 and we want the cursor at the bottom
-                start_y = (cur_y + 1) * height - 1 - spacing
-                # draw the cursor line
-                draw.line((start_x, start_y, start_x + cur_width, start_y), fill=self.black)
+            if cursor and self.cursor:
+                if self.cursor == 'block':
+                    image = self.draw_block_cursor(cursor, image)
+                else:
+                    self.draw_line_cursor(cursor, draw)
             # rotate image if using landscape
             if not portrait:
                 image = image.rotate(90, expand=True)
@@ -291,6 +372,14 @@ class PaperTTY:
             return image
         else:
             self.error("Display not ready")
+    
+    def clear(self):
+        """Clears the display; set all black, then all white, or use INIT mode, if driver supports it."""
+        if self.ready():
+            self.driver.clear()
+            print('Display reinitialized.')
+        else:
+            self.error("Display not ready")
 
 
 class Settings:
@@ -310,12 +399,22 @@ def get_drivers():
     """Get the list of available drivers as a dict
     Format: { '<NAME>': { 'desc': '<DESCRIPTION>', 'class': <CLASS> }, ... }"""
     driverdict = {}
-    driverlist = [drivers_partial.EPD1in54, drivers_partial.EPD2in13, drivers_partial.EPD2in13v2, drivers_partial.EPD2in9,
-                  drivers_partial.EPD2in13d,
-                  drivers_full.EPD2in7, drivers_full.EPD4in2, drivers_full.EPD7in5,
-                  drivers_color.EPD4in2b, drivers_color.EPD7in5b, drivers_color.EPD5in83, drivers_color.EPD5in83b,
-                  drivers_colordraw.EPD1in54b, drivers_colordraw.EPD1in54c, drivers_colordraw.EPD2in13b,
-                  drivers_colordraw.EPD2in7b, drivers_colordraw.EPD2in9b,
+    driverlist = [drivers_partial.EPD1in54, drivers_partial.EPD2in13,
+                  drivers_partial.EPD2in13v2, drivers_partial.EPD2in9,
+                  drivers_partial.EPD2in13d, driver_4in2.EPD4in2,
+
+                  drivers_full.EPD2in7, drivers_full.EPD7in5,
+                  drivers_full.EPD7in5v2,
+
+                  drivers_color.EPD4in2b, drivers_color.EPD7in5b,
+                  drivers_color.EPD5in83, drivers_color.EPD5in83b,
+
+                  drivers_colordraw.EPD1in54b, drivers_colordraw.EPD1in54c,
+                  drivers_colordraw.EPD2in13b, drivers_colordraw.EPD2in7b,
+                  drivers_colordraw.EPD2in9b,
+
+                  driver_it8951.IT8951,
+
                   drivers_base.Dummy, drivers_base.Bitmap]
     for driver in driverlist:
         driverdict[driver.__name__] = {'desc': driver.__doc__, 'class': driver}
@@ -331,7 +430,7 @@ def get_driver_list():
 @click.group()
 @click.option('--driver', default=None, help='Select display driver')
 @click.option('--nopartial', is_flag=True, default=False, help="Don't use partial updates even if display supports it")
-@click.option('--encoding', default='utf-8', help='Encoding to use for the buffer', show_default=True)
+@click.option('--encoding', default='latin_1', help='Encoding to use for the buffer', show_default=True)
 @click.pass_context
 def cli(ctx, driver, nopartial, encoding):
     """Display stdin or TTY on a Waveshare e-Paper display"""
@@ -371,12 +470,13 @@ def scrub(settings, size):
 @click.option('--width', default=None, help='Fit to width [default: display width / font width]')
 @click.option('--portrait', default=False, is_flag=True, help='Use portrait orientation', show_default=True)
 @click.option('--nofold', default=False, is_flag=True, help="Don't fold the input", show_default=True)
-@click.option('--spacing', default=0, help='Line spacing for the text', show_default=True)
+@click.option('--spacing', default='0', help='Line spacing for the text, "auto" to automatically determine a good value', show_default=True)
 @click.pass_obj
 def stdin(settings, font, fontsize, width, portrait, nofold, spacing):
     """Display standard input and leave it on screen"""
     settings.args['font'] = font
     settings.args['fontsize'] = fontsize
+    settings.args['spacing'] = spacing
     ptty = settings.get_init_tty()
     text = sys.stdin.read()
     if not nofold:
@@ -386,7 +486,7 @@ def stdin(settings, font, fontsize, width, portrait, nofold, spacing):
             font_width = ptty.font.getsize('M')[0]
             max_width = int((ptty.driver.width - 8) / font_width) if portrait else int(ptty.driver.height / font_width)
             text = ptty.fold(text, width=max_width)
-    ptty.showtext(text, fill=ptty.driver.black, portrait=portrait, spacing=spacing)
+    ptty.showtext(text, fill=ptty.driver.black, portrait=portrait)
 
 
 @click.command()
@@ -408,23 +508,43 @@ def vnc(settings, host, display, password, rotate, invert, sleep, fullevery):
 @click.option('--font', default=PaperTTY.defaultfont, help='Path to a TrueType or PIL font', show_default=True)
 @click.option('--size', 'fontsize', default=8, help='Font size', show_default=True)
 @click.option('--noclear', default=False, is_flag=True, help='Leave display content on exit')
-@click.option('--nocursor', default=False, is_flag=True, help="Don't draw the cursor")
+@click.option('--nocursor', default=False, is_flag=True, help="(DEPRECATED, use --cursor=none instead) Don't draw the cursor")
+@click.option('--cursor', default='legacy', help='Set cursor type. Valid values are default (underscore cursor at a sensible place), block (inverts colors at cursor), none (draws no cursor) or a number n (underscore cursor n pixels from the bottom)', show_default=False)
 @click.option('--sleep', default=0.1, help='Minimum sleep between refreshes', show_default=True)
 @click.option('--rows', 'ttyrows', default=None, help='Set TTY rows (--cols required too)')
 @click.option('--cols', 'ttycols', default=None, help='Set TTY columns (--rows required too)')
 @click.option('--portrait', default=False, is_flag=True, help='Use portrait orientation', show_default=False)
 @click.option('--flipx', default=False, is_flag=True, help='Flip X axis (EXPERIMENTAL/BROKEN)', show_default=False)
 @click.option('--flipy', default=False, is_flag=True, help='Flip Y axis (EXPERIMENTAL/BROKEN)', show_default=False)
-@click.option('--spacing', default=0, help='Line spacing for the text', show_default=True)
+@click.option('--spacing', default='0', help='Line spacing for the text, "auto" to automatically determine a good value', show_default=True)
 @click.option('--scrub', 'apply_scrub', is_flag=True, default=False, help='Apply scrub when starting up',
               show_default=True)
 @click.option('--autofit', is_flag=True, default=False, help='Autofit terminal size to font size', show_default=True)
+@click.option('--attributes', is_flag=True, default=False, help='Use attributes', show_default=True)
+@click.option('--interactive', is_flag=True, default=False, help='Interactive mode')
 @click.pass_obj
-def terminal(settings, vcsa, font, fontsize, noclear, nocursor, sleep, ttyrows, ttycols, portrait, flipx, flipy,
-             spacing, apply_scrub, autofit):
+def terminal(settings, vcsa, font, fontsize, noclear, nocursor, cursor, sleep, ttyrows, ttycols, portrait, flipx, flipy,
+             spacing, apply_scrub, autofit, attributes, interactive):
     """Display virtual console on an e-Paper display, exit with Ctrl-C."""
     settings.args['font'] = font
     settings.args['fontsize'] = fontsize
+    settings.args['spacing'] = spacing
+
+    if cursor != 'legacy' and nocursor:
+        print("--cursor and --nocursor can't be used together. To hide the cursor, use --cursor=none")
+        sys.exit(1)
+
+    if nocursor:
+        print("--nocursor is deprecated. Use --cursor=none instead")
+        settings.args['cursor'] = None
+
+    if cursor == 'default' or cursor == 'legacy':
+        settings.args['cursor'] = 'default'
+    elif cursor == 'none':
+        settings.args['cursor'] = None
+    else:
+        settings.args['cursor'] = cursor
+
     ptty = settings.get_init_tty()
 
     if apply_scrub:
@@ -433,14 +553,18 @@ def terminal(settings, vcsa, font, fontsize, noclear, nocursor, sleep, ttyrows, 
     oldimage = None
     oldcursor = None
     # dirty - should refactor to make this cleaner
-    flags = {'scrub_requested': False}
-
+    flags = {'scrub_requested': False, 'show_menu': False, 'clear': False}
+    
     # handle SIGINT from `systemctl stop` and Ctrl-C
     def sigint_handler(sig, frame):
-        print("Exiting (SIGINT)...")
-        if not noclear:
-            ptty.showtext(oldbuff, fill=ptty.white, **textargs)
+        if not interactive:
+            print("Exiting (SIGINT)...")
+            if not noclear:
+                ptty.showtext(oldbuff, fill=ptty.white, **textargs)
             sys.exit(0)
+        else:
+             print('Showing menu, please wait ...')
+             flags['show_menu'] = True
 
     # toggle scrub flag when SIGUSR1 received
     def sigusr1_handler(sig, frame):
@@ -451,7 +575,7 @@ def terminal(settings, vcsa, font, fontsize, noclear, nocursor, sleep, ttyrows, 
     signal.signal(signal.SIGUSR1, sigusr1_handler)
 
     # group the various params for readability
-    textargs = {'portrait': portrait, 'flipx': flipx, 'flipy': flipy, 'spacing': spacing}
+    textargs = {'portrait': portrait, 'flipx': flipx, 'flipy': flipy}
 
     if any([ttyrows, ttycols]) and not all([ttyrows, ttycols]):
         ptty.error("You must define both --rows and --cols to change terminal size.")
@@ -461,45 +585,125 @@ def terminal(settings, vcsa, font, fontsize, noclear, nocursor, sleep, ttyrows, 
         else:
             # if size not specified manually, see if autofit was requested
             if autofit:
-                max_dim = ptty.fit(portrait, spacing)
+                max_dim = ptty.fit(portrait)
                 print("Automatic resize of TTY to {} rows, {} columns".format(max_dim[1], max_dim[0]))
                 ptty.set_tty_size(ptty.ttydev(vcsa), max_dim[1], max_dim[0])
-        print("Started displaying {}, minimum update interval {} s, exit with Ctrl-C".format(vcsa, sleep))
+        if interactive:
+            print("Started displaying {}, minimum update interval {} s, open menu with Ctrl-C".format(vcsa, sleep))
+        else:
+            print("Started displaying {}, minimum update interval {} s, exit with Ctrl-C".format(vcsa, sleep))
+        character_width, vcsudev = ptty.vcsudev(vcsa)
         while True:
-            # if SIGUSR1 toggled the scrub flag, scrub display and start with a fresh image
+            if flags['show_menu']:
+                flags['show_menu'] = False
+                print()
+                print('Rendering paused. Enter')
+                print('    (f) to change font,')
+                print('    (s) to change spacing,')
+                if ptty.is_truetype:
+                    print('    (h) to change font size,')
+                print('    (c) to scrub,')
+                print('    (i) reinitialize display,')
+                print('    (r) do a full refresh,')
+                print('    (x) to exit,')
+                print('    anything else to continue.')
+                print('Command line arguments for current settings:\n    --font {} --size {} --spacing {}'.format(ptty.fontfile, ptty.fontsize, ptty.spacing))
+
+                ch = sys.stdin.readline().strip()
+                if ch == 'x':
+                    if not noclear:
+                        ptty.showtext(oldbuff, fill=ptty.white, **textargs)
+                    sys.exit(0)
+                elif ch == 'f':
+                    print('Current font: {}'.format(ptty.fontfile))
+                    new_font = click.prompt('Enter new font (leave empty to abort)', default='', show_default=False)
+                    if new_font:
+                        ptty.spacing = spacing
+                        ptty.font = ptty.load_font(new_font, keep_if_not_found=True)
+                        if autofit:
+                            max_dim = ptty.fit(portrait)
+                            print("Automatic resize of TTY to {} rows, {} columns".format(max_dim[1], max_dim[0]))
+                            ptty.set_tty_size(ptty.ttydev(vcsa), max_dim[1], max_dim[0])
+                        oldbuff = None
+                    else:
+                        print('Font not changed')
+                elif ch == 's':
+                    print('Current spacing: {}'.format(ptty.spacing))
+                    new_spacing = click.prompt('Enter new spacing (leave empty to abort)', default='empty', type=int, show_default=False)
+                    if new_spacing != 'empty':
+                        ptty.spacing = new_spacing
+                        ptty.recalculate_font()
+                        if autofit:
+                            max_dim = ptty.fit(portrait)
+                            print("Automatic resize of TTY to {} rows, {} columns".format(max_dim[1], max_dim[0]))
+                            ptty.set_tty_size(ptty.ttydev(vcsa), max_dim[1], max_dim[0])
+                        oldbuff = None
+                    else:
+                        print('Spacing not changed')
+                elif ch == 'h' and ptty.is_truetype:
+                    print('Current font size: {}'.format(ptty.fontsize))
+                    new_fontsize = click.prompt('Enter new font size (leave empty to abort)', default='empty', type=int, show_default=False)
+                    if new_fontsize != 'empty':
+                        ptty.fontsize = new_fontsize
+                        ptty.spacing = spacing
+                        ptty.font = ptty.load_font(path=None)
+                        if autofit:
+                            max_dim = ptty.fit(portrait)
+                            print("Automatic resize of TTY to {} rows, {} columns".format(max_dim[1], max_dim[0]))
+                            ptty.set_tty_size(ptty.ttydev(vcsa), max_dim[1], max_dim[0])
+                        oldbuff = None
+                    else:
+                        print('Font size not changed')
+                elif ch == 'c':
+                    flags['scrub_requested'] = True
+                elif ch == 'i':
+                    ptty.clear()
+                    oldimage = None
+                    oldbuff = None
+                elif ch == 'r':
+                    if oldimage:
+                        ptty.driver.reset()
+                        ptty.driver.init(partial=False)
+                        ptty.driver.draw(0, 0, oldimage)
+                        ptty.driver.reset()
+                        ptty.driver.init(ptty.partial)
+
+            # if user or SIGUSR1 toggled the scrub flag, scrub display and start with a fresh image
             if flags['scrub_requested']:
                 ptty.driver.scrub()
                 # clear old image and buffer and restore flag
                 oldimage = None
                 oldbuff = ''
                 flags['scrub_requested'] = False
+            
             with open(vcsa, 'rb') as f:
-                # read the first 4 bytes to get the console attributes
-                attributes = f.read(4)
-                rows, cols, x, y = list(map(ord, struct.unpack('cccc', attributes)))
+                with open(vcsudev, 'rb') as vcsu:
+                    # read the first 4 bytes to get the console attributes
+                    attributes = f.read(4)
+                    rows, cols, x, y = list(map(ord, struct.unpack('cccc', attributes)))
 
-                # read rest of the console content into buffer
-                buff = f.read()
-                # SKIP all the attribute bytes
-                # (change this (and write more code!) if you want to use the attributes with a
-                # three-color display)
-                buff = buff[0::2]
-                # find character under cursor (in case using a non-fixed width font)
-                char_under_cursor = buff[y * rows + x]
-                cursor = (x, y, char_under_cursor)
-                # add newlines per column count
-                buff = ''.join([r.decode(ptty.encoding, 'ignore') + '\n' for r in ptty.split(buff, cols)])
-                # do something only if content has changed or cursor was moved
-                if buff != oldbuff or cursor != oldcursor:
-                    # show new content
-                    oldimage = ptty.showtext(buff, fill=ptty.black, cursor=cursor if not nocursor else None,
-                                             oldimage=oldimage,
-                                             **textargs)
-                    oldbuff = buff
-                    oldcursor = cursor
-                else:
-                    # delay before next update check
-                    time.sleep(float(sleep))
+                    # read from the text buffer 
+                    buff = vcsu.read()
+                    if character_width == 4:
+                        # work around weird bug
+                        buff = buff.replace(b'\x20\x20\x20\x20', b'\x20\x00\x00\x00')
+                    # find character under cursor (in case using a non-fixed width font)
+                    char_under_cursor = buff[character_width * (y * rows + x):character_width * (y * rows + x + 1)]
+                    encoding = 'utf_32' if character_width == 4 else ptty.encoding
+                    cursor = (x, y, char_under_cursor.decode(encoding, 'ignore'))
+                    # add newlines per column count
+                    buff = ''.join([r.decode(encoding, 'replace') + '\n' for r in ptty.split(buff, cols * character_width)])
+                    # do something only if content has changed or cursor was moved
+                    if buff != oldbuff or cursor != oldcursor:
+                        # show new content
+                        oldimage = ptty.showtext(buff, fill=ptty.black, cursor=cursor if not nocursor else None,
+                                                oldimage=oldimage,
+                                                **textargs)
+                        oldbuff = buff
+                        oldcursor = cursor
+                    else:
+                        # delay before next update check
+                        time.sleep(float(sleep))
 
 
 if __name__ == '__main__':

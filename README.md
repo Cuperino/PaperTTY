@@ -1,6 +1,42 @@
 # PaperTTY
 
-## VNC Update
+## Partial refresh support for 4.2" *(2020-03-01)*
+
+Thanks to @gdkrmr, the 4.2" module now has a new driver that supports partial refresh. Note that now the default behavior is to do partial updates and you'll need to add `--nopartial` to driver settings if you want to use the full refresh instead.
+
+## Interactive Update *(2020-02-18)*
+
+Starting `terminal` with the `--interactive` option adds a menu to the Ctrl-C handler that allows you to change the font, font size and spacing on the fly. This should be helpful when trying out fonts.
+
+## Cursor Update *(2020-01-25)*
+
+The `terminal` mode now supports different cursors. `--nocursor` had been deprecated in favor of `--cursor=none`. The usual underscore-like cursor is set via `--cursor=default`, which, as the name suggests, is also the default mode. There is also a `--cursor=block` option, which inverts the colors at the cursor's location. Finally, there is also an option to provide a numerical value, e.g. `--cursor=5`, which draws an underscore cursor shifted 5 pixels towards the top; `--cursor=default` and `--cursor=0` are thus equivalent.
+
+## Unicode Update *(2020-01-22)*
+
+On systems with /dev/vcsu* (e.g. Raspbian Stretch or Buster, with kernel 4.19+) and when using a TrueType font, the `terminal` mode now has full support for Unicode output. This is automatic, with a fallback to 8-bit if either of these requirements isn't met. We've also changed the standard encoding for 8-bit to ISO-8859-1, which should be a little closer to what the `vcs` device provides.
+
+## IT8951 Optimization II *(2020-01-15)*
+
+The previous optimization was improved further to speed up VNC output too. If you try it, please leave a comment at https://github.com/joukos/PaperTTY/issues/32 (and create a new issue if there's problems).
+
+## IT8951 Optimization *(2020-01-11)*
+
+An optimization by @chi-lambda for the IT8951 driver was merged and may speed up the bit-packing in TTY mode even by up to **10x** for these displays, so the refresh rates should be significantly better now. Please create an issue if there are problems (the unoptimized version can be checked out with the tag `v0.03_unoptimized`).
+
+## IT8951 Update *(2019-11-03)*
+
+Support for IT8951 based displays kindly provided by @fimad has been merged. This means that Waveshare 6", 7.8", 9.7" and 10.3" may work since they use this controller. At least the 6" and 9.7" displays have been verified to work. A big thanks to everyone involved with the discussion and code contributions (https://github.com/joukos/PaperTTY/issues/25)!
+
+If you have one of these displays and want to test it, add your experiences to https://github.com/joukos/PaperTTY/issues/32.
+
+Here is a picture of the 9.7" in action (by @math85360):
+
+![](pics/vnc_97_inch_by_math85360.jpg)
+
+[YouTube video](https://www.youtube.com/watch?v=J5WbhSV2E_U)
+
+## VNC Update *(2019-07-07)*
 
 So, it's been almost a year since last update and I've been very very busy.
 
@@ -475,7 +511,6 @@ Some notes:
     - The `scrub` feature may be entirely unnecessary for normally functioning units
 - The code is surely littered with bugs and could use some refactoring
 - You need to figure out the parameters, font and encodings that work for *you*
-  - Importantly, Unicode support is lacking because the virtual terminal stores glyph indices in the buffer and the original value is lost in translation - my understanding is that there is currently development [being done](https://lkml.org/lkml/2018/6/26/1062) for the kernel to implement `/dev/vcsu*` which would rectify this, but it's not yet in the mainline kernel - option to use a pseudo TTY would be welcome in the mean time
 - Not much thought given to tricolor displays - you need to modify the part where attributes are skipped and implement it yourself (or donate such a display and I might take a look...)
 - Minimal error handling
 - You can't set an arbitrary size for the terminals with `ioctl`s - it would be better to use some pseudo terminal for this but then again, sometimes you specifically want `tty1` (imagine server crashing and having the kernel log imprinted on the e-ink)
